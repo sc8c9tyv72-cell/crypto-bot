@@ -1,0 +1,2 @@
+[deploy]
+startCmd = "bash start.sh"
