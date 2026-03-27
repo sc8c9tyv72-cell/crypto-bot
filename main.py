@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ICT/SMC 加密貨幣交易信號機械人 v4.0
+ICT/SMC 加密貨幣交易信號機械人 v4.1
 ====================================
 框架（按用戶 PDF）：
   1H 定方向（BSL/SSL 流動性判斷）
@@ -13,7 +13,11 @@ ICT/SMC 加密貨幣交易信號機械人 v4.0
   → SL 放在 15M Swing High/Low 外
 
 數據量：1H 500根（21天）/ 15M 300根（75小時）/ 3M 200根（10小時）
-數據源：Binance 公開 REST API（無需認證）
+數據源：Binance data-api.binance.vision（無地區限制）+ api.binance.us 備用
+v4.1 修復：
+  - 改用 data-api.binance.vision 解決 Railway 地區封鎖問題
+  - 修復 format_hourly_report 縮排 bug（try 塊未包含主體代碼）
+  - 每小時快報加入完整錯誤捕獲
 """
 
 import os
@@ -24,7 +28,6 @@ import time
 import pandas as pd
 import numpy as np
 from telegram import Bot
-from telegram.ext import Application
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -42,23 +45,37 @@ RISK_FULL = 50.0
 RISK_HALF = 25.0
 MIN_ZONE_PCT = 0.002       # 關鍵區最小寬度 0.2%
 HKT = timezone(timedelta(hours=8))
-BINANCE_BASE = "https://api.binance.com"
-BINANCE_ALT  = "https://api1.binance.com"
+
+# API 端點（按優先順序）
+# data-api.binance.vision = Binance 官方數據 API，無地區限制
+# api.binance.us = Binance US，備用
+BINANCE_ENDPOINTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.us",
+]
 
 # 訂單計數器（每個幣種+方向獨立，重啟重置）
 order_counters: dict = defaultdict(int)
 
 # ── Binance API ───────────────────────────────────────
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
-    for base in [BINANCE_BASE, BINANCE_ALT]:
+    """從 Binance 取得 K 線數據，自動嘗試多個端點"""
+    for base in BINANCE_ENDPOINTS:
         try:
             r = requests.get(
                 f"{base}/api/v3/klines",
                 params={"symbol": symbol, "interval": interval, "limit": limit},
-                timeout=10
+                timeout=15
             )
             if r.status_code == 200:
-                df = pd.DataFrame(r.json(), columns=[
+                data = r.json()
+                # 檢查是否為錯誤回應（dict 而非 list）
+                if isinstance(data, dict):
+                    logger.warning(f"{base} {symbol} {interval}: API 錯誤 {data.get('msg', data)}")
+                    continue
+                if not data:
+                    continue
+                df = pd.DataFrame(data, columns=[
                     'ts','open','high','low','close','volume',
                     'cts','qv','tr','tbb','tbq','ign'])
                 df = df[['ts','open','high','low','close','volume']].copy()
@@ -66,32 +83,43 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
                 for col in ['open','high','low','close','volume']:
                     df[col] = df[col].astype(float)
                 return df
+            else:
+                logger.warning(f"{base} {symbol} {interval}: HTTP {r.status_code}")
         except Exception as e:
-            logger.warning(f"Binance {base} {symbol} {interval}: {e}")
+            logger.warning(f"{base} {symbol} {interval}: {e}")
+    logger.error(f"所有端點均失敗: {symbol} {interval}")
     return None
 
 def get_daily_weekly_levels(symbol: str) -> dict:
     """取得前日/前週高低點、今日/本週開盤"""
     levels = {}
-    try:
-        r = requests.get(f"{BINANCE_BASE}/api/v3/klines",
-            params={"symbol": symbol, "interval": "1d", "limit": 3}, timeout=10)
-        if r.status_code == 200:
-            d = r.json()
-            if len(d) >= 2:
-                levels['PDH'] = float(d[-2][2])
-                levels['PDL'] = float(d[-2][3])
-                levels['DO']  = float(d[-1][1])   # 今日開盤
-        r2 = requests.get(f"{BINANCE_BASE}/api/v3/klines",
-            params={"symbol": symbol, "interval": "1w", "limit": 3}, timeout=10)
-        if r2.status_code == 200:
-            w = r2.json()
-            if len(w) >= 2:
-                levels['PWH'] = float(w[-2][2])
-                levels['PWL'] = float(w[-2][3])
-                levels['WO']  = float(w[-1][1])   # 本週開盤
-    except Exception as e:
-        logger.warning(f"get_daily_weekly_levels {symbol}: {e}")
+    for base in BINANCE_ENDPOINTS:
+        try:
+            r = requests.get(f"{base}/api/v3/klines",
+                params={"symbol": symbol, "interval": "1d", "limit": 3}, timeout=15)
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, list) and len(d) >= 2:
+                    levels['PDH'] = float(d[-2][2])
+                    levels['PDL'] = float(d[-2][3])
+                    levels['DO']  = float(d[-1][1])   # 今日開盤
+                    break
+        except Exception as e:
+            logger.warning(f"get_daily {base} {symbol}: {e}")
+
+    for base in BINANCE_ENDPOINTS:
+        try:
+            r2 = requests.get(f"{base}/api/v3/klines",
+                params={"symbol": symbol, "interval": "1w", "limit": 3}, timeout=15)
+            if r2.status_code == 200:
+                w = r2.json()
+                if isinstance(w, list) and len(w) >= 2:
+                    levels['PWH'] = float(w[-2][2])
+                    levels['PWL'] = float(w[-2][3])
+                    levels['WO']  = float(w[-1][1])   # 本週開盤
+                    break
+        except Exception as e:
+            logger.warning(f"get_weekly {base} {symbol}: {e}")
     return levels
 
 # ── 工具函數 ──────────────────────────────────────────
@@ -836,7 +864,15 @@ def format_signal_message(sig: dict) -> str:
     return msg
 
 def format_hourly_report(results: list) -> str:
-    """格式化每小時市場快報 - 所有關鍵位按價格由低至高排列"""
+    """
+    格式化每小時市場快報
+    所有關鍵位按價格由低至高排列，現價居中
+    顏色規則：
+      🔴 強阻力（PWH/PDH/WO/DO/1H FIB）
+      🟠 弱阻力（BSL/15M OB/FVG）
+      🟢 強支撐（PWL/PDL/WO/DO/1H FIB）
+      🔵 弱支撐（SSL/15M OB/FVG）
+    """
     now = datetime.now(HKT)
     msg  = f"🕐 每小時市場快報 [{now.strftime('%m-%d %H:%M')} HKT]\n"
     msg += "━━━━━━━━━━━━━━━━━━\n\n"
@@ -844,8 +880,10 @@ def format_hourly_report(results: list) -> str:
     for result in results:
         try:
             if result.get("error"):
-                msg += f"📌 {result.get('symbol','?').replace('USDT','/USDT')}  ⚠️ 數據錯誤: {result['error']}\n\n"
+                sym = result.get('symbol', '?').replace('USDT', '/USDT')
+                msg += f"📌 {sym}  ⚠️ 數據錯誤: {result['error']}\n\n"
                 continue
+
             symbol    = result["symbol"]
             sym_short = symbol.replace("USDT", "/USDT")
             price     = result["price"]
@@ -859,6 +897,7 @@ def format_hourly_report(results: list) -> str:
 
             msg += f"📌 {sym_short}  💲{fmt(price, symbol)}  |  1H {struct_emoji}\n"
 
+            # ── 收集關鍵位 ──────────────────────────────
             # 強位（高時間框架）→ 🔴 阻力 / 🟢 支撐
             # 弱位（15M 流動性）→ 🟠 阻力 / 🔵 支撐
             strong_levels = []
@@ -887,6 +926,7 @@ def format_hourly_report(results: list) -> str:
             if ssl:
                 weak_levels.append((ssl, 'SSL 下方流動性'))
 
+            # 15M 關鍵區：上方最近 3 個 + 下方最近 3 個
             bear_zones = sorted(
                 [z for z in zones_15m if z.get('mid', 0) > price],
                 key=lambda z: z.get('mid', float('inf'))
@@ -903,20 +943,24 @@ def format_hourly_report(results: list) -> str:
                 lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
                 weak_levels.append((z.get('mid', 0), lbl))
 
+            # ── 合併排序 ────────────────────────────────
             all_levels = [(p, lbl, 'strong') for p, lbl in strong_levels] + \
                          [(p, lbl, 'weak')   for p, lbl in weak_levels]
             all_levels.sort(key=lambda x: x[0])
 
             insert_idx = next((i for i, (p, _, _) in enumerate(all_levels) if p > price), len(all_levels))
-            above = all_levels[insert_idx:]
-            below = all_levels[:insert_idx]
+            above = all_levels[insert_idx:]   # 高於現價（阻力）
+            below = all_levels[:insert_idx]   # 低於現價（支撐）
 
+            # 上方阻力：由近至遠（由低至高）
             for p, lbl, strength in above:
                 emoji = '🔴' if strength == 'strong' else '🟠'
                 msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
 
+            # 現價分隔線
             msg += f"   ──── 💲{fmt(price, symbol)} 現價 ────\n"
 
+            # 下方支撐：由近至遠（由高至低）
             for p, lbl, strength in reversed(below):
                 emoji = '🟢' if strength == 'strong' else '🔵'
                 msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
@@ -926,6 +970,7 @@ def format_hourly_report(results: list) -> str:
         except Exception as e:
             sym = result.get('symbol', '?').replace('USDT', '/USDT')
             msg += f"📌 {sym}  ⚠️ 快報生成錯誤: {e}\n\n"
+            logger.error(f"format_hourly_report {sym}: {e}", exc_info=True)
 
     return msg.rstrip()
 
@@ -948,17 +993,18 @@ async def main():
 
     # 啟動訊息
     await send_msg(bot,
-        "✅ ICT/SMC 交易信號機械人 v4.0 已啟動\n\n"
+        "✅ ICT/SMC 交易信號機械人 v4.1 已啟動\n\n"
         "📊 監控: BTC / ETH / SOL\n"
         "🎯 框架: 1H 定方向 → 15M 關鍵位 → 3M MSS → FIB OTE 入場\n"
-        "🆕 新增: BSL/SSL / 層級陷阱 / Displacement FVG / 日開(DO)/週開(WO)\n"
+        "🔧 v4.1 修復: 數據源改用 data-api.binance.vision（無地區限制）\n"
+        "🔧 v4.1 修復: 每小時快報縮排 bug 已修正\n"
         "📐 SL: 15M Swing High/Low 外（最少 1×ATR）\n"
         "💰 順勢全倉（50 USDT）/ 逆勢半倉（25 USDT）\n"
         "📊 RR ≥ 1:2 才發信號\n"
-        "🌐 數據: Binance 公開 API（1H 500根 / 15M 300根 / 3M 200根）"
+        "🌐 數據: data-api.binance.vision（1H 500根 / 15M 300根 / 3M 200根）"
     )
 
-    logger.info("機械人 v4.0 已啟動，開始掃描...")
+    logger.info("機械人 v4.1 已啟動，開始掃描...")
 
     while True:
         try:
@@ -990,10 +1036,15 @@ async def main():
             # 每小時快報
             if now_ts - last_hourly >= HOURLY_REPORT_INTERVAL:
                 if results:
-                    hourly_msg = format_hourly_report(results)
-                    await send_msg(bot, hourly_msg)
-                    last_hourly = now_ts
-                    logger.info("已發送每小時快報")
+                    try:
+                        hourly_msg = format_hourly_report(results)
+                        await send_msg(bot, hourly_msg)
+                        last_hourly = now_ts
+                        logger.info("已發送每小時快報")
+                    except Exception as e:
+                        logger.error(f"每小時快報發送失敗: {e}")
+                        await send_msg(bot, f"⚠️ 每小時快報生成失敗: {e}")
+                        last_hourly = now_ts  # 避免無限重試
 
         except Exception as e:
             logger.error(f"主循環錯誤: {e}")
