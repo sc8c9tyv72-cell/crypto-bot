@@ -992,26 +992,31 @@ def format_hourly_report(results: list) -> str:
             below = sorted([(p, lbl, st, pr) for p, lbl, st, pr in candidates if p < price],
                            key=lambda x: x[0], reverse=True)  # 由近至遠
 
-            # ── FIB 輔助標記函數 ────────────────────────────
+            # ── FIB 輔助標記函數 ──────────────────────────────────
             def fib_tag(p: float) -> str:
-                """若 FIB 關鍵位在 p 附近 ±0.5%，返回標記字串"""
+                """
+                若 FIB 關鍵位在 p 附近 ±0.5%，返回簡短標記
+                只顯示數字，不加 'FIB' 字樣。例： [+0.618]  或  [+0.5, 0.705]
+                """
                 if not fib_1h:
                     return ""
                 tags = []
-                for k, name in [("0.5", "0.5"), ("0.618", "0.618"), ("0.705", "0.705"), ("0.786", "0.786")]:
+                for k in ["0.5", "0.618", "0.705", "0.786"]:
                     fv = fib_1h.get(k, 0)
                     if fv and abs(p - fv) / max(fv, 0.001) < 0.005:
-                        tags.append(f"FIB {name}")
+                        tags.append(k)
                 return f" [+{', '.join(tags)}]" if tags else ""
 
-            # ── 選取最外圍定方向位 ─────────────────────────
-            # 最外圍 = 最遠的上方位 + 最遠的下方位（定大方向用）
+            # ── 最外圍定方向位 ──────────────────────────────────
+            # 「最遠」= 候選池中價格最遠離現價的關鍵位，不限定類型
+            # 作用：顯示大方向轉變的最遠關鍵位（可能是 PWH/PDH/OB/BSL 任何類型）
             outer_above = above[-1] if above else None   # 最遠上方
             outer_below = below[-1] if below else None   # 最遠下方
 
-            # ── 選取最近 2 個上方 + 最近 2 個下方 ───────────
+            # ── 中間四個：最近 2 個阻力 + 最近 2 個支撑 ──────────────────
+            # 「最近」= 直接靠近現價的供應/需求位，不限定類型
             near_above = above[:2]   # 最近 2 個阻力
-            near_below = below[:2]   # 最近 2 個支撐
+            near_below = below[:2]   # 最近 2 個支撑
 
             # 確保最外圍位不與最近位重複
             def is_same(a, b):
