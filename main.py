@@ -581,31 +581,82 @@ def find_entry_signal(result: dict) -> dict | None:
         sl, sl_desc = find_sl_anchor_zone(
             entry_price, direction, zones_15m, zones_4h,
             highs_15m, lows_15m, atr_15m)
-        sl_dist = abs(entry_price - sl)
 
+        # ── SL 方向校驗：做多 SL 必須在入場下方，做空 SL 必須在入場上方 ──
+        if direction == "bullish" and sl >= entry_price:
+            sl = entry_price - atr_15m * 2
+            sl_desc = "ATR×2 保護（已修正方向）"
+        elif direction == "bearish" and sl <= entry_price:
+            sl = entry_price + atr_15m * 2
+            sl_desc = "ATR×2 保護（已修正方向）"
+
+        sl_dist = abs(entry_price - sl)
         min_dist = max(price * 0.005, atr_15m * 1.0)
         if sl_dist < min_dist:
             sl = entry_price - min_dist if direction == "bullish" else entry_price + min_dist
             sl_dist = min_dist
             sl_desc += "（已擴展至最小距離）"
 
+        # ── TP 計算：必須在入場的正確方向 ──
         tp1 = tp2 = None
         tp_label = ""
-        if fib_15m:
-            tp1 = fib_15m.get("0.5")
-        if direction == "bearish":
-            below_liq = [e["price"] for e in eql if e["price"] < price]
-            tp2 = max(below_liq) if below_liq else None
-            tp_label = "EQL 流動性" if tp2 else "15M FIB 0.5"
-        else:
-            above_liq = [e["price"] for e in eqh if e["price"] > price]
-            tp2 = min(above_liq) if above_liq else None
-            tp_label = "EQH 流動性" if tp2 else "15M FIB 0.5"
 
+        # 先找流動性目標（最高優先級）
+        if direction == "bullish":
+            # 做多 TP：找入場上方的 EQH 或 BSL
+            above_liq = sorted([e["price"] for e in eqh if e["price"] > entry_price])
+            bsl_val = result.get("bsl")
+            if above_liq:
+                tp1 = above_liq[0]   # 最近的上方流動性
+                tp_label = "EQH 流動性"
+                if len(above_liq) > 1:
+                    tp2 = above_liq[1]
+            elif bsl_val and bsl_val > entry_price:
+                tp1 = bsl_val
+                tp_label = "BSL 上方流動性"
+            # 如果流動性目標 RR 不夠，改用 1H 供應區
+            if tp1 and (tp1 - entry_price) / sl_dist < MIN_RR:
+                above_supply = sorted(
+                    [z for z in zones_1h if z.get('direction') == 'bearish'
+                     and z.get('mid', 0) > entry_price],
+                    key=lambda z: z.get('mid', 0))
+                if above_supply:
+                    tp1 = above_supply[0]['mid']
+                    tp_label = above_supply[0].get('label', '1H 供應區')
+        else:
+            # 做空 TP：找入場下方的 EQL 或 SSL
+            below_liq = sorted([e["price"] for e in eql if e["price"] < entry_price], reverse=True)
+            ssl_val = result.get("ssl")
+            if below_liq:
+                tp1 = below_liq[0]   # 最近的下方流動性
+                tp_label = "EQL 流動性"
+                if len(below_liq) > 1:
+                    tp2 = below_liq[1]
+            elif ssl_val and ssl_val < entry_price:
+                tp1 = ssl_val
+                tp_label = "SSL 下方流動性"
+            if tp1 and (entry_price - tp1) / sl_dist < MIN_RR:
+                below_demand = sorted(
+                    [z for z in zones_1h if z.get('direction') == 'bullish'
+                     and z.get('mid', 0) < entry_price],
+                    key=lambda z: z.get('mid', 0), reverse=True)
+                if below_demand:
+                    tp1 = below_demand[0]['mid']
+                    tp_label = below_demand[0].get('label', '1H 需求區')
+
+        # 如果仍然找不到合適的 TP，用 RR 計算
         if not tp1:
             tp1 = (entry_price - sl_dist * MIN_RR if direction == "bearish"
                    else entry_price + sl_dist * MIN_RR)
             tp_label = f"1:{MIN_RR:.0f} RR 目標"
+
+        # TP 方向最終校驗
+        if direction == "bullish" and tp1 <= entry_price:
+            tp1 = entry_price + sl_dist * MIN_RR
+            tp_label = f"1:{MIN_RR:.0f} RR 目標（已修正方向）"
+        elif direction == "bearish" and tp1 >= entry_price:
+            tp1 = entry_price - sl_dist * MIN_RR
+            tp_label = f"1:{MIN_RR:.0f} RR 目標（已修正方向）"
 
         tp_dist = abs(entry_price - tp1)
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
@@ -717,21 +768,38 @@ def format_signal_message(sig: dict) -> str:
             msg += f"📐 1H FIB OTE 區: {fmt(ote_low, symbol)} - {fmt(ote_high, symbol)}\n"
             msg += f"   0.705（最佳入場）: {fmt(fib_1h.get('0.705', 0), symbol)}\n\n"
     msg += f"📈 交易方向: {dir_emoji}\n\n"
-    msg += f"💵 入場方式: {entry_label}\n"
-    if disp_fvg:
-        msg += f"   30% 市價入場: {fmt(sig['price'], symbol)}\n"
-        msg += f"   70% FVG 掛單: {fmt(disp_fvg['mid'], symbol)}\n"
+    msg += "──────────────────\n"
+
+    if direction == "bullish":
+        # 做多：由上至下 = TP → 入場 → SL
+        msg += f"🎯 TP1: {fmt(tp1, symbol)}"
+        if tp2 and tp2 != tp1:
+            msg += f"  |  TP2: {fmt(tp2, symbol)}"
+        msg += f"\n   └ {tp_label}\n"
+        msg += f"📍 入場: {fmt(entry, symbol)}"
+        if disp_fvg:
+            msg += f"  (市價 {fmt(sig['price'], symbol)} + FVG {fmt(disp_fvg['mid'], symbol)})"
+        else:
+            msg += f"  ({entry_label})"
+        msg += "\n"
+        msg += f"🛑 SL: {fmt(sl, symbol)}\n"
+        msg += f"   └ {sl_desc}\n"
     else:
-        msg += f"   入場價格: {fmt(entry, symbol)}\n"
-    msg += "\n"
-    msg += f"🛑 止損 (SL): {fmt(sl, symbol)}\n"
-    msg += f"   └ {sl_desc}\n\n"
-    msg += f"🎯 止盈 TP1: {fmt(tp1, symbol)}\n"
-    msg += f"   └ {tp_label}\n"
-    if tp2 and tp2 != tp1:
-        msg += f"🎯 止盈 TP2: {fmt(tp2, symbol)}\n"
-        msg += f"   └ 延伸目標（流動性）\n"
-    msg += f"📊 預計 RR: 1:{rr:.1f}\n\n"
+        # 做空：由上至下 = SL → 入場 → TP
+        msg += f"🛑 SL: {fmt(sl, symbol)}\n"
+        msg += f"   └ {sl_desc}\n"
+        msg += f"📍 入場: {fmt(entry, symbol)}"
+        if disp_fvg:
+            msg += f"  (市價 {fmt(sig['price'], symbol)} + FVG {fmt(disp_fvg['mid'], symbol)})"
+        else:
+            msg += f"  ({entry_label})"
+        msg += "\n"
+        msg += f"🎯 TP1: {fmt(tp1, symbol)}"
+        if tp2 and tp2 != tp1:
+            msg += f"  |  TP2: {fmt(tp2, symbol)}"
+        msg += f"\n   └ {tp_label}\n"
+
+    msg += f"📊 RR: 1:{rr:.1f}\n\n"
     if bsl or ssl:
         msg += "💧 流動性參考:\n"
         if bsl:
@@ -1196,18 +1264,9 @@ async def scheduled_analysis_loop(bot: Bot):
         await asyncio.sleep(60)  # 每分鐘檢查一次
 
 # ── 主程式 ─────────────────────────────────────────────────────────
-async def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 環境變數")
-        return
-
-    # 建立 Application（支援 MessageHandler）
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+async def post_init(app: Application) -> None:
+    """PTB 啟動後回調：發送啟動訊息並啟動背景任務"""
     bot = app.bot
-
     await send_msg(bot,
         "✅ ICT/SMC 交易信號機械人 v5.0 已啟動\n\n"
         "① 自動入場訊號：BTC / ETH / SOL（即時掃描）\n"
@@ -1216,15 +1275,30 @@ async def main():
         "④ 雙向情景：輸入「BTC分析」取得即時雙向情景\n\n"
         "🌐 數據：data-api.binance.vision"
     )
-
     logger.info("機械人 v5.0 已啟動")
+    # 在 PTB 的 event loop 內啟動背景任務（避免 event loop 衝突）
+    asyncio.create_task(signal_scan_loop(bot))
+    asyncio.create_task(scheduled_analysis_loop(bot))
 
-    # 同時運行三個異步任務
-    await asyncio.gather(
-        app.run_polling(drop_pending_updates=True),
-        signal_scan_loop(bot),
-        scheduled_analysis_loop(bot),
+
+def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 環境變數")
+        return
+
+    # 建立 Application，用 post_init 啟動背景任務
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # run_polling 自己管理 event loop，不需要 asyncio.run()
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
