@@ -1,4 +1,0 @@
-The origin repo main.py at laiyipkan3313-max/crypto-bot contains chat messages pasted as code content.
-Lines 1-30+ are Chinese text from the conversation, not Python code.
-The user manually edited main.py on GitHub and pasted the entire conversation instead of just the code.
-Need to directly edit the file on GitHub with the correct Python code.
